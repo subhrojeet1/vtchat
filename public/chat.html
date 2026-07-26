@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Correspond</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="chat-page">
+  <div class="shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <div class="brand"><span class="mark">C</span> Correspond</div>
+        <div class="me" id="meLabel"></div>
+      </div>
+
+      <div class="search-box">
+        <input type="text" id="searchInput" placeholder="Search people…">
+      </div>
+
+      <ul class="contact-list" id="contactList"></ul>
+
+      <div class="sidebar-footer">
+        <button class="signout-btn" id="signoutBtn">Sign out</button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="conversation-header">
+        <h2 id="convTitle">Select a conversation</h2>
+        <span class="conversation-sub" id="convSub"></span>
+      </div>
+
+      <div class="message-pane" id="messagePane">
+        <div class="empty-note">Pick "Everyone" for the group room, or a name below to message someone privately.</div>
+      </div>
+
+      <div class="typing-line" id="typingLine"></div>
+
+      <div class="composer">
+        <div class="pending-file" id="pendingFile">
+          <span id="pendingFileName"></span>
+          <button id="clearFileBtn">remove</button>
+        </div>
+        <div class="composer-row">
+          <button class="icon-btn" id="attachBtn" title="Attach a file">📎</button>
+          <input type="file" id="fileInput" style="display:none">
+          <textarea id="textInput" rows="1" placeholder="Write something…" disabled></textarea>
+          <button class="send-btn" id="sendBtn" disabled>Send</button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+  const token = localStorage.getItem('token');
+  const myUsername = localStorage.getItem('username');
+
+  if (!token) location.href = '/index.html';
+
+  document.getElementById('meLabel').textContent = myUsername;
+
+  const contactList = document.getElementById('contactList');
+  const searchInput = document.getElementById('searchInput');
+  const convTitle = document.getElementById('convTitle');
+  const convSub = document.getElementById('convSub');
+  const messagePane = document.getElementById('messagePane');
+  const typingLine = document.getElementById('typingLine');
+  const textInput = document.getElementById('textInput');
+  const sendBtn = document.getElementById('sendBtn');
+  const attachBtn = document.getElementById('attachBtn');
+  const fileInput = document.getElementById('fileInput');
+  const pendingFile = document.getElementById('pendingFile');
+  const pendingFileName = document.getElementById('pendingFileName');
+  const clearFileBtn = document.getElementById('clearFileBtn');
+
+  const REACTION_CHOICES = ['👍', '❤️', '😂', '😮', '😢', '🙏'];
+
+  let contacts = [];
+  let onlineUsers = new Set();
+  let unread = new Map();  // 'general' or a username -> count
+  let active = null;       // { type: 'group' } or { type: 'dm', user }
+  let attachedFile = null;
+  let typingTimer = null;
+  let lastTypingSent = 0;
+  let searchTerm = '';
+  let renderedMessages = new Map(); // message id -> { cardEl, groupEl, msg }
+
+  function authedFetch(url, opts = {}) {
+    opts.headers = { ...(opts.headers || {}), Authorization: `Bearer ${token}` };
+    return fetch(url, opts);
+  }
+
+  function conversationKey(conv) {
+    return conv.type === 'group' ? 'general' : conv.user;
+  }
+
+  function updateTabTitle() {
+    let total = 0;
+    unread.forEach((count) => (total += count));
+    document.title = total > 0 ? `(${total}) Correspond` : 'Correspond';
+  }
+
+  // a stable, pleasant color per username so the same person always gets
+  // the same avatar color, without storing anything extra server-side
+  function avatarColor(name) {
+    let hash = 0;
+    for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash);
+    const hue = Math.abs(hash) % 360;
+    return `hsl(${hue}, 42%, 40%)`;
+  }
+
+  function buildAvatar(name, size) {
+    const el = document.createElement('span');
+    el.className = 'avatar';
+    el.style.width = el.style.height = size + 'px';
+    el.style.fontSize = Math.round(size * 0.42) + 'px';
+    el.style.background = avatarColor(name);
+    el.textContent = name.charAt(0).toUpperCase();
+    return el;
+  }
+
+  // ---------- sidebar ----------
+
+  function renderSidebar() {
+    contactList.innerHTML = '';
+
+    if (!searchTerm) {
+      contactList.appendChild(buildContactRow({ type: 'group' }, 'Everyone', true));
+    }
+
+    const filtered = contacts.filter((name) => name.toLowerCase().includes(searchTerm));
+
+    if (filtered.length) {
+      const label = document.createElement('div');
+      label.className = 'nav-label';
+      label.style.marginTop = searchTerm ? '0' : '14px';
+      label.textContent = 'Direct messages';
+      contactList.appendChild(label);
+    }
+
+    filtered.forEach((name) => {
+      contactList.appendChild(buildContactRow({ type: 'dm', user: name }, name, false));
+    });
+
+    updateTabTitle();
+  }
+
+  function buildContactRow(conv, label, isGroup) {
+    const key = conversationKey(conv);
+    const li = document.createElement('li');
+    li.className = 'contact' + (isGroup ? ' group' : '') +
+      (active && conversationKey(active) === key ? ' active' : '');
+
+    const avatarHolder = buildAvatar(isGroup ? '#' : conv.user, 28);
+    if (!isGroup) {
+      avatarHolder.style.position = 'relative';
+      const dot = document.createElement('span');
+      dot.className = 'seal-dot' + (onlineUsers.has(conv.user) ? ' online' : '');
+      dot.style.position = 'absolute';
+      dot.style.right = '-2px';
+      dot.style.bottom = '-2px';
+      avatarHolder.appendChild(dot);
+    }
+    li.appendChild(avatarHolder);
+
+    const name = document.createElement('span');
+    name.className = 'contact-name';
+    name.textContent = label;
+    li.appendChild(name);
+
+    const count = unread.get(key) || 0;
+    if (count > 0) {
+      const badge = document.createElement('span');
+      badge.className = 'unread-badge';
+      badge.textContent = count > 9 ? '9+' : String(count);
+      li.appendChild(badge);
+    }
+
+    li.addEventListener('click', () => openConversation(conv));
+    return li;
+  }
+
+  searchInput.addEventListener('input', () => {
+    searchTerm = searchInput.value.trim().toLowerCase();
+    renderSidebar();
+  });
+
+  // ---------- conversation switching ----------
+
+  async function openConversation(conv) {
+    active = conv;
+    unread.set(conversationKey(conv), 0);
+    renderSidebar();
+
+    textInput.disabled = false;
+    sendBtn.disabled = false;
+    typingLine.textContent = '';
+    renderedMessages.clear();
+    lastRenderedGroup = null;
+    lastRenderedDate = null;
+
+    if (conv.type === 'group') {
+      convTitle.textContent = 'Everyone';
+      convSub.textContent = 'Visible to everyone signed up';
+    } else {
+      convTitle.textContent = conv.user;
+      convSub.textContent = onlineUsers.has(conv.user) ? 'Online now' : 'Offline';
+    }
+
+    const url = conv.type === 'group' ? '/api/messages/general' : `/api/messages/with/${conv.user}`;
+    const res = await authedFetch(url);
+    const history = await res.json();
+
+    messagePane.innerHTML = '';
+    if (history.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'empty-note';
+      empty.textContent = conv.type === 'group'
+        ? 'Nothing here yet. Say something.'
+        : `No messages with ${conv.user} yet.`;
+      messagePane.appendChild(empty);
+    } else {
+      history.forEach((msg) => appendMessage(msg, false));
+    }
+    scrollToBottom();
+  }
+
+  // ---------- messages ----------
+
+  function formatTime(ts) {
+    return new Date(ts).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  }
+
+  function formatDateLabel(ts) {
+    const d = new Date(ts);
+    const today = new Date();
+    const yesterday = new Date();
+    yesterday.setDate(today.getDate() - 1);
+
+    if (d.toDateString() === today.toDateString()) return 'Today';
+    if (d.toDateString() === yesterday.toDateString()) return 'Yesterday';
+    return d.toLocaleDateString([], { month: 'long', day: 'numeric', year: 'numeric' });
+  }
+
+  let lastRenderedGroup = null; // { sender, timestamp, el }
+  let lastRenderedDate = null;  // a date string, for inserting dividers
+
+  function maybeInsertDateDivider(msg) {
+    const label = formatDateLabel(msg.timestamp);
+    if (label === lastRenderedDate) return;
+    lastRenderedDate = label;
+    lastRenderedGroup = null; // force a fresh message group under the new date too
+
+    const divider = document.createElement('div');
+    divider.className = 'date-divider';
+    divider.innerHTML = `<span>${label}</span>`;
+    messagePane.appendChild(divider);
+  }
+
+  function buildReactionBar(msg) {
+    const bar = document.createElement('div');
+    bar.className = 'reaction-bar';
+
+    Object.entries(msg.reactions || {}).forEach(([emoji, users]) => {
+      const pill = document.createElement('button');
+      pill.className = 'reaction-pill' + (users.includes(myUsername) ? ' mine' : '');
+      pill.textContent = `${emoji} ${users.length}`;
+      pill.addEventListener('click', () => socket.emit('react message', { id: msg.id, emoji }));
+      bar.appendChild(pill);
+    });
+
+    const addBtn = document.createElement('button');
+    addBtn.className = 'reaction-add';
+    addBtn.textContent = '+';
+    addBtn.title = 'React';
+    addBtn.addEventListener('click', (e) => openReactionPicker(e, msg.id));
+    bar.appendChild(addBtn);
+
+    return bar;
+  }
+
+  let openPicker = null;
+  function openReactionPicker(event, messageId) {
+    if (openPicker) openPicker.remove();
+    const picker = document.createElement('div');
+    picker.className = 'reaction-picker';
+    REACTION_CHOICES.forEach((emoji) => {
+      const btn = document.createElement('button');
+      btn.textContent = emoji;
+      btn.addEventListener('click', () => {
+        socket.emit('react message', { id: messageId, emoji });
+        picker.remove();
+      });
+      picker.appendChild(btn);
+    });
+    document.body.appendChild(picker);
+    const rect = event.target.getBoundingClientRect();
+    picker.style.left = rect.left + 'px';
+    picker.style.top = (rect.top - 44) + 'px';
+    openPicker = picker;
+
+    setTimeout(() => {
+      document.addEventListener('click', function closeOnce(e) {
+        if (!picker.contains(e.target)) {
+          picker.remove();
+          document.removeEventListener('click', closeOnce);
+        }
+      });
+    }, 0);
+  }
+
+  function appendMessage(msg, isLive) {
+    const mine = msg.from === myUsername;
+    const clearsEmpty = messagePane.querySelector('.empty-note');
+    if (clearsEmpty) clearsEmpty.remove();
+
+    maybeInsertDateDivider(msg);
+
+    const canMerge = lastRenderedGroup
+      && lastRenderedGroup.sender === msg.from
+      && (msg.timestamp - lastRenderedGroup.timestamp) < 5 * 60 * 1000;
+
+    let cardWrap;
+    if (canMerge) {
+      cardWrap = lastRenderedGroup.el;
+    } else {
+      cardWrap = document.createElement('div');
+      cardWrap.className = 'msg-group ' + (mine ? 'mine' : 'theirs');
+
+      const byline = document.createElement('div');
+      byline.className = 'msg-byline';
+      if (!mine) {
+        byline.appendChild(buildAvatar(msg.from, 16));
+        const nameSpan = document.createElement('span');
+        nameSpan.textContent = msg.from;
+        byline.appendChild(nameSpan);
+      }
+      const timeSpan = document.createElement('span');
+      timeSpan.className = 'byline-time';
+      timeSpan.textContent = formatTime(msg.timestamp);
+      byline.appendChild(timeSpan);
+      cardWrap.appendChild(byline);
+
+      messagePane.appendChild(cardWrap);
+      lastRenderedGroup = { sender: msg.from, timestamp: msg.timestamp, el: cardWrap };
+    }
+
+    const card = document.createElement('div');
+    card.className = 'note-card';
+    card.dataset.id = msg.id;
+
+    if (mine) {
+      const actions = document.createElement('div');
+      actions.className = 'msg-actions';
+
+      if (msg.text) {
+        const editBtn = document.createElement('button');
+        editBtn.textContent = '✎';
+        editBtn.title = 'Edit';
+        editBtn.addEventListener('click', () => startEditing(msg.id));
+        actions.appendChild(editBtn);
+      }
+
+      const delBtn = document.createElement('button');
+      delBtn.textContent = '🗑';
+      delBtn.title = 'Delete';
+      delBtn.addEventListener('click', () => {
+        if (confirm('Delete this message?')) socket.emit('delete message', { id: msg.id });
+      });
+      actions.appendChild(delBtn);
+
+      card.appendChild(actions);
+    }
+
+    const textEl = document.createElement('div');
+    textEl.className = 'note-text';
+    if (msg.text) textEl.textContent = msg.text;
+    card.appendChild(textEl);
+
+    if (msg.editedAt) {
+      const editedTag = document.createElement('span');
+      editedTag.className = 'edited-tag';
+      editedTag.textContent = '(edited)';
+      card.appendChild(editedTag);
+    }
+
+    if (msg.fileLink) {
+      if (msg.fileIsImage) {
+        const img = document.createElement('img');
+        img.className = 'attachment-image';
+        img.src = msg.fileLink;
+        img.addEventListener('click', () => window.open(msg.fileLink, '_blank'));
+        card.appendChild(img);
+      } else {
+        const link = document.createElement('a');
+        link.className = 'attachment';
+        link.href = msg.fileLink;
+        link.target = '_blank';
+        link.textContent = '📎 ' + msg.fileName;
+        card.appendChild(link);
+      }
+    }
+
+    card.appendChild(buildReactionBar(msg));
+
+    cardWrap.appendChild(card);
+    lastRenderedGroup.timestamp = msg.timestamp;
+    renderedMessages.set(msg.id, { cardEl: card, groupEl: cardWrap, msg });
+
+    if (isLive) scrollToBottom();
+  }
+
+  function startEditing(id) {
+    const entry = renderedMessages.get(id);
+    if (!entry) return;
+    const textEl = entry.cardEl.querySelector('.note-text');
+    const original = entry.msg.text;
+
+    const textarea = document.createElement('textarea');
+    textarea.className = 'edit-textarea';
+    textarea.value = original;
+    textEl.replaceWith(textarea);
+    textarea.focus();
+
+    const finish = (save) => {
+      if (save && textarea.value.trim() && textarea.value.trim() !== original) {
+        socket.emit('edit message', { id, text: textarea.value.trim() });
+      } else {
+        const restored = document.createElement('div');
+        restored.className = 'note-text';
+        restored.textContent = original;
+        textarea.replaceWith(restored);
+      }
+    };
+
+    textarea.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); finish(true); }
+      if (e.key === 'Escape') finish(false);
+    });
+    textarea.addEventListener('blur', () => finish(true));
+  }
+
+  function scrollToBottom() {
+    messagePane.scrollTop = messagePane.scrollHeight;
+  }
+
+  function messageBelongsToActive(msg) {
+    if (!active) return false;
+    if (active.type === 'group') return msg.room === 'general';
+    const other = msg.from === myUsername ? msg.to : msg.from;
+    return active.type === 'dm' && other === active.user;
+  }
+
+  // ---------- loading contacts ----------
+
+  async function loadContacts() {
+    const res = await authedFetch('/api/users');
+    if (res.status === 401) return signOut();
+    contacts = await res.json();
+    renderSidebar();
+  }
+
+  // ---------- socket ----------
+
+  const socket = io();
+
+  socket.on('connect', () => socket.emit('authenticate', token));
+  socket.on('auth_error', signOut);
+
+  socket.on('presence', (names) => {
+    onlineUsers = new Set(names);
+    renderSidebar();
+    if (active && active.type === 'dm') {
+      convSub.textContent = onlineUsers.has(active.user) ? 'Online now' : 'Offline';
+    }
+  });
+
+  socket.on('chat message', (msg) => {
+    if (messageBelongsToActive(msg)) {
+      appendMessage(msg, true);
+    } else if (msg.from !== myUsername) {
+      const key = msg.room === 'general' ? 'general' : msg.from;
+      unread.set(key, (unread.get(key) || 0) + 1);
+      renderSidebar();
+    }
+  });
+
+  socket.on('message edited', (data) => {
+    const entry = renderedMessages.get(data.id);
+    if (!entry) return;
+    entry.msg.text = data.text;
+    entry.msg.editedAt = data.editedAt;
+    const textEl = entry.cardEl.querySelector('.note-text, .edit-textarea');
+    if (textEl) {
+      const replacement = document.createElement('div');
+      replacement.className = 'note-text';
+      replacement.textContent = data.text;
+      textEl.replaceWith(replacement);
+    }
+    if (!entry.cardEl.querySelector('.edited-tag')) {
+      const tag = document.createElement('span');
+      tag.className = 'edited-tag';
+      tag.textContent = '(edited)';
+      entry.cardEl.appendChild(tag);
+    }
+  });
+
+  socket.on('message deleted', (data) => {
+    const entry = renderedMessages.get(data.id);
+    if (!entry) return;
+    const group = entry.groupEl;
+    entry.cardEl.remove();
+    renderedMessages.delete(data.id);
+    if (!group.querySelector('.note-card')) group.remove();
+  });
+
+  socket.on('message reacted', (data) => {
+    const entry = renderedMessages.get(data.id);
+    if (!entry) return;
+    entry.msg.reactions = data.reactions;
+    const oldBar = entry.cardEl.querySelector('.reaction-bar');
+    const newBar = buildReactionBar(entry.msg);
+    oldBar.replaceWith(newBar);
+  });
+
+  socket.on('typing', (data) => {
+    if (!active) return;
+    const forActive = (active.type === 'group' && data.to === null)
+      || (active.type === 'dm' && data.from === active.user);
+    if (!forActive) return;
+
+    typingLine.textContent = `${data.from} is typing…`;
+    clearTimeout(typingTimer);
+    typingTimer = setTimeout(() => (typingLine.textContent = ''), 2500);
+  });
+
+  // ---------- composer ----------
+
+  textInput.addEventListener('input', () => {
+    if (!active) return;
+    const now = Date.now();
+    if (now - lastTypingSent > 2000) {
+      socket.emit('typing', { to: active.type === 'dm' ? active.user : null });
+      lastTypingSent = now;
+    }
+  });
+
+  textInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+
+  attachBtn.addEventListener('click', () => fileInput.click());
+
+  fileInput.addEventListener('change', async () => {
+    const file = fileInput.files[0];
+    if (!file) return;
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    pendingFileName.textContent = `Uploading ${file.name}…`;
+    pendingFile.classList.add('visible');
+
+    const res = await authedFetch('/upload', { method: 'POST', body: formData });
+    const data = await res.json();
+
+    if (!res.ok) {
+      pendingFileName.textContent = data.error || 'Upload failed';
+      return;
+    }
+    attachedFile = data;
+    pendingFileName.textContent = `Ready: ${data.fileName}`;
+  });
+
+  clearFileBtn.addEventListener('click', () => {
+    attachedFile = null;
+    fileInput.value = '';
+    pendingFile.classList.remove('visible');
+  });
+
+  function sendMessage() {
+    if (!active) return;
+    const text = textInput.value.trim();
+    if (!text && !attachedFile) return;
+
+    socket.emit('chat message', {
+      to: active.type === 'dm' ? active.user : null,
+      text,
+      fileLink: attachedFile ? attachedFile.fileLink : null,
+      fileName: attachedFile ? attachedFile.fileName : null
+    });
+
+    textInput.value = '';
+    attachedFile = null;
+    pendingFile.classList.remove('visible');
+    fileInput.value = '';
+  }
+
+  sendBtn.addEventListener('click', sendMessage);
+
+  // ---------- sign out ----------
+
+  function signOut() {
+    localStorage.clear();
+    location.href = '/index.html';
+  }
+  document.getElementById('signoutBtn').addEventListener('click', async () => {
+    await authedFetch('/logout', { method: 'POST' });
+    signOut();
+  });
+
+  loadContacts();
+</script>
+</body>
+</html>

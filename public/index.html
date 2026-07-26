@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Correspond</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="auth-page">
+  <div class="auth-card">
+    <div class="mark">C</div>
+    <h1 id="heading">Welcome back</h1>
+    <p class="lede" id="lede">Sign in to pick up where you left off.</p>
+
+    <form id="authForm">
+      <div class="field">
+        <label for="username">Username</label>
+        <input type="text" id="username" autocomplete="username" required>
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input type="password" id="password" autocomplete="current-password" required>
+      </div>
+      <button class="primary" type="submit" id="submitBtn">Sign in</button>
+    </form>
+
+    <div class="form-status" id="status"></div>
+
+    <div class="switch-row">
+      <span id="switchText">New here?</span> <a id="switchLink">Create an account</a>
+    </div>
+  </div>
+
+<script>
+  const heading = document.getElementById('heading');
+  const lede = document.getElementById('lede');
+  const form = document.getElementById('authForm');
+  const submitBtn = document.getElementById('submitBtn');
+  const status = document.getElementById('status');
+  const switchText = document.getElementById('switchText');
+  const switchLink = document.getElementById('switchLink');
+
+  let mode = 'login';
+
+  if (localStorage.getItem('token')) {
+    location.href = '/chat.html';
+  }
+
+  function setStatus(msg, kind) {
+    status.textContent = msg;
+    status.className = 'form-status' + (kind ? ' ' + kind : '');
+  }
+
+  function applyMode() {
+    if (mode === 'signup') {
+      heading.textContent = 'Create an account';
+      lede.textContent = 'Pick a username - you\'ll use it to sign in and it\'s how others will find you.';
+      submitBtn.textContent = 'Sign up';
+      switchText.textContent = 'Already have an account?';
+      switchLink.textContent = 'Sign in';
+    } else {
+      heading.textContent = 'Welcome back';
+      lede.textContent = 'Sign in to pick up where you left off.';
+      submitBtn.textContent = 'Sign in';
+      switchText.textContent = 'New here?';
+      switchLink.textContent = 'Create an account';
+    }
+    setStatus('');
+  }
+
+  switchLink.addEventListener('click', () => {
+    mode = mode === 'login' ? 'signup' : 'login';
+    applyMode();
+  });
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    submitBtn.disabled = true;
+    setStatus('');
+
+    const username = document.getElementById('username').value.trim();
+    const password = document.getElementById('password').value;
+
+    try {
+      if (mode === 'signup') {
+        const res = await fetch('/signup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error);
+
+        setStatus('Account created. Sign in below.', 'ok');
+        mode = 'login';
+        applyMode();
+      } else {
+        const res = await fetch('/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error);
+
+        localStorage.setItem('token', data.token);
+        localStorage.setItem('username', data.username);
+        location.href = '/chat.html';
+      }
+    } catch (err) {
+      setStatus(err.message || 'Something went wrong.', 'error');
+    } finally {
+      submitBtn.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>
