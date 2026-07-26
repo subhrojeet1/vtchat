@@ -1,4 +1,4 @@
-# Correspond
+# Vtchat
 
 Group chat and private messaging with accounts, file sharing, message
 editing/deleting, emoji reactions, and a paper-and-ink visual design.
